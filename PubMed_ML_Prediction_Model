@@ -1,0 +1,199 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from imblearn.combine import SMOTEENN
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, VotingClassifier, ExtraTreesClassifier
+from sklearn.metrics import classification_report, roc_curve, auc, accuracy_score, precision_score, recall_score, f1_score
+from xgboost import XGBClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.svm import SVC
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from sklearn.neighbors import KNeighborsClassifier
+import os
+
+# 设置随机种子范围
+seeds = [42, 99, 123, 256, 789]  # 可扩展随机种子范围
+n_splits = len(seeds)
+
+# 读取数据
+file_path = r'C:/Users/Administrator/Desktop/12.13有显著性差异数据-填充.xlsx'
+data = pd.read_excel(file_path)
+
+# 提取特征和目标变量
+X = data.iloc[:, :-1]  # 特征
+y = data.iloc[:, -1]   # 目标变量
+
+# 将目标变量转换为二分类
+y = np.where(y > 0.5, 1, 0)
+
+# 数据标准化
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# 平衡数据（使用 SMOTEENN）
+smote_enn = SMOTEENN(random_state=42)
+X, y = smote_enn.fit_resample(X, y)
+
+# 划分训练集和独立测试集
+X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# 定义模型
+models = {
+    'Logistic Regression': LogisticRegression(class_weight='balanced', max_iter=500),
+    'Decision Tree': DecisionTreeClassifier(random_state=42, class_weight='balanced', max_depth=5),
+    'Random Forest': RandomForestClassifier(random_state=42, class_weight='balanced', max_depth=10, n_estimators=100),
+    'Gradient Boosting': GradientBoostingClassifier(random_state=42, max_depth=5, n_estimators=100),
+    'AdaBoost': AdaBoostClassifier(random_state=42, algorithm='SAMME', n_estimators=50),
+    'XGBoost': XGBClassifier(random_state=42, max_depth=3, n_estimators=50, reg_lambda=2.0, reg_alpha=1.0),
+    'Naive Bayes': GaussianNB(),
+    'SVM (RBF Kernel)': SVC(probability=True, kernel='rbf', random_state=42, class_weight='balanced', C=1.0),
+    'LightGBM': LGBMClassifier(random_state=42, class_weight='balanced', max_depth=5, n_estimators=100, lambda_l1=0.5, lambda_l2=0.5),
+    'CatBoost': CatBoostClassifier(verbose=0, random_state=42, max_depth=5, iterations=50, l2_leaf_reg=3),
+    'KNN': KNeighborsClassifier(n_neighbors=5),
+    'Extra Trees': ExtraTreesClassifier(random_state=42, class_weight='balanced', max_depth=10, n_estimators=100)
+}
+
+# 模型融合（Voting Classifier）
+voting_clf = VotingClassifier(
+    estimators=[('rf', models['Random Forest']), ('xgb', models['XGBoost']), ('cat', models['CatBoost']), ('lr', models['Logistic Regression'])],
+    voting='soft',
+    weights=[2, 1, 1, 1]
+)
+models['Voting Classifier'] = voting_clf
+
+# 1. 5-CV 交叉验证
+evaluation_metrics = []
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+plt.figure(figsize=(12, 8))
+mean_fpr = np.linspace(0, 1, 100)
+
+for model_name, model in models.items():
+    print(f"Evaluating {model_name} with 5-CV...")
+    cv_auc_scores = []
+    cv_accuracy_scores = []
+    cv_precision_scores = []
+    cv_recall_scores = []
+    cv_f1_scores = []
+    tprs = []  # 用于存储每折的 TPR
+
+    for train_idx, val_idx in skf.split(X_train_val, y_train_val):
+        X_train_fold, X_val_fold = X_train_val[train_idx], X_train_val[val_idx]
+        y_train_fold, y_val_fold = y_train_val[train_idx], y_train_val[val_idx]
+
+        # 模型训练
+        model.fit(X_train_fold, y_train_fold)
+        
+        # 预测概率和类别
+        if hasattr(model, "predict_proba"):
+            y_prob = model.predict_proba(X_val_fold)[:, 1]
+            fpr, tpr, _ = roc_curve(y_val_fold, y_prob)
+            tprs.append(np.interp(mean_fpr, fpr, tpr))  # 插值
+            tprs[-1][0] = 0.0
+            cv_auc_scores.append(auc(fpr, tpr))
+        
+        # 分类预测
+        y_pred = model.predict(X_val_fold)
+        
+        # 计算其他评价指标
+        cv_accuracy_scores.append(accuracy_score(y_val_fold, y_pred))
+        cv_precision_scores.append(precision_score(y_val_fold, y_pred))
+        cv_recall_scores.append(recall_score(y_val_fold, y_pred))
+        cv_f1_scores.append(f1_score(y_val_fold, y_pred))
+
+    # 绘制平均 ROC 曲线
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = auc(mean_fpr, mean_tpr)
+    plt.plot(mean_fpr, mean_tpr, label=f"{model_name} (AUC = {mean_auc:.2f})")
+
+    # 存储平均结果
+    evaluation_metrics.append({
+        'Model': model_name,
+        'Mean AUC': f"{np.mean(cv_auc_scores):.4f} ± {np.std(cv_auc_scores):.4f}",
+        'Mean Accuracy': f"{np.mean(cv_accuracy_scores):.4f} ± {np.std(cv_accuracy_scores):.4f}",
+        'Mean Precision': f"{np.mean(cv_precision_scores):.4f} ± {np.std(cv_precision_scores):.4f}",
+        'Mean Recall': f"{np.mean(cv_recall_scores):.4f} ± {np.std(cv_recall_scores):.4f}",
+        'Mean F1-Score': f"{np.mean(cv_f1_scores):.4f} ± {np.std(cv_f1_scores):.4f}"
+    })
+
+# 绘制对角线
+plt.plot([0, 1], [0, 1], linestyle='--', color='gray', lw=2)
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Mean ROC Curve Across Models (5-CV)')
+plt.legend(loc='lower right')
+plt.grid()
+plt.show()
+
+# 转换交叉验证结果为 DataFrame
+evaluation_df = pd.DataFrame(evaluation_metrics)
+
+# 输出交叉验证结果到 Excel
+output_cv_path = os.path.join(os.path.expanduser("~"), "Desktop", "5cv交叉验证结果12.06.4.xlsx")
+evaluation_df.to_excel(output_cv_path, index=False)
+print(f"\n交叉验证结果已保存到：{output_cv_path}")
+
+# 打印交叉验证结果
+print("\n交叉验证结果：")
+print(evaluation_df)
+
+# 2. 多次划分独立测试集并绘制 ROC 曲线
+test_metrics = {model_name: {'AUC': [], 'Accuracy': [], 'Precision': [], 'Recall': [], 'F1': [], 'fpr': [], 'tpr': []} for model_name in models.keys()}
+
+plt.figure(figsize=(12, 8))
+mean_fpr = np.linspace(0, 1, 100)
+
+for seed in seeds:
+    print(f"Evaluating with random seed {seed}...")
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
+    for model_name, model in models.items():
+        model.fit(X_train, y_train)
+        y_prob = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+        auc_score = auc(*roc_curve(y_test, y_prob)[:2]) if y_prob is not None else None
+        fpr, tpr, _ = roc_curve(y_test, y_prob) if y_prob is not None else (None, None, None)
+        
+        test_metrics[model_name]['AUC'].append(auc_score)
+        test_metrics[model_name]['Accuracy'].append(accuracy_score(y_test, model.predict(X_test)))
+        test_metrics[model_name]['Precision'].append(precision_score(y_test, model.predict(X_test)))
+        test_metrics[model_name]['Recall'].append(recall_score(y_test, model.predict(X_test)))
+        test_metrics[model_name]['F1'].append(f1_score(y_test, model.predict(X_test)))
+        test_metrics[model_name]['fpr'].append(fpr)
+        test_metrics[model_name]['tpr'].append(tpr)
+
+# 绘制 ROC 曲线
+for model_name, metrics in test_metrics.items():
+    mean_fpr = np.linspace(0, 1, 100)
+    mean_tpr = np.mean([np.interp(mean_fpr, fpr, tpr) for fpr, tpr in zip(metrics['fpr'], metrics['tpr'])], axis=0)
+    plt.plot(mean_fpr, mean_tpr, label=f"{model_name} (AUC = {np.mean(metrics['AUC']):.2f})")
+
+plt.plot([0, 1], [0, 1], linestyle='--', color='gray', lw=2)
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Mean ROC Curve Across Models (Independent Test Set)')
+plt.legend(loc='lower right')
+plt.grid()
+plt.show()
+
+# 汇总独立测试集结果
+final_metrics = []
+for model_name, metrics in test_metrics.items():
+    final_metrics.append({
+        'Model': model_name,
+        'AUC (mean ± SD)': f"{np.mean(metrics['AUC']):.3f} ± {np.std(metrics['AUC']):.3f}",
+        'Accuracy (mean ± SD)': f"{np.mean(metrics['Accuracy']):.3f} ± {np.std(metrics['Accuracy']):.3f}",
+        'Precision (mean ± SD)': f"{np.mean(metrics['Precision']):.3f} ± {np.std(metrics['Precision']):.3f}",
+        'Recall (mean ± SD)': f"{np.mean(metrics['Recall']):.3f} ± {np.std(metrics['Recall']):.3f}",
+        'F1-Score (mean ± SD)': f"{np.mean(metrics['F1']):.3f} ± {np.std(metrics['F1']):.3f}"
+    })
+
+# 保存独立测试集结果到 Excel
+independent_results_df = pd.DataFrame(final_metrics)
+independent_results_path = os.path.join(os.path.expanduser("~"), "Desktop", "独立测试集结果12.06.4.xlsx")
+independent_results_df.to_excel(independent_results_path, index=False)
+print(f"独立测试集结果已保存到：{independent_results_path}")
